@@ -3,10 +3,12 @@
 /**
  * مراتب — GitHub Pages-ready static app.
  * Data is fetched from ./data/students.json. The PDF source has 301 rows.
- * IMPORTANT: public GitHub repositories expose all data under /data/.
+ * No national ID values are shipped. Search uses a one-way digest.
+ * Note: hashing does NOT protect against exhaustive guessing on a public static site.
  */
 const $ = (selector) => document.querySelector(selector);
-const state = { students: [], query: '', grade: 'all', sort: 'rank', page: 1, pageSize: 25, filtered: [] };
+const state = { students: [], query: '', nationalSearchHash: null, grade: 'all', sort: 'rank', page: 1, pageSize: 25, filtered: [] };
+let searchRevision = 0;
 const collator = new Intl.Collator('ar', { sensitivity: 'base', numeric: true });
 let toastTimer;
 
@@ -34,12 +36,43 @@ const twoDecimals = (value) => Number(value).toFixed(2);
 const gradeClass = (grade) => grade === 'امتياز' ? 'excellent' : grade === 'جيد جداً' ? 'very-good' : 'good';
 const getInitials = (name) => String(name).trim().charAt(0) || 'ط';
 
+// The public dataset contains only one-way digests, never plaintext national IDs.
+// A full, exact ID can be matched locally; partial numeric lookup is intentionally disabled.
+async function hashNationalId(number) {
+  const payload = new TextEncoder().encode(`marateb-2025-2026-id-v1:${number}`);
+  const bytes = await crypto.subtle.digest('SHA-256', payload);
+  return [...new Uint8Array(bytes)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
 function matchQuery(student, input) {
-  if (!input) return true;
-  const tokens = normalize(input).split(' ').filter(Boolean);
-  const searchable = student._normalizedName;
-  const id = student.nationalId || '';
-  return tokens.every((token) => searchable.includes(token) || id.includes(token));
+  if (!input.trim()) return true;
+  const cleaned = normalize(input);
+  if (/^\d+$/.test(cleaned)) {
+    return !!state.nationalSearchHash && student.idHash === state.nationalSearchHash;
+  }
+  const tokens = cleaned.split(' ').filter(Boolean);
+  return tokens.every((token) => student._normalizedName.includes(token));
+}
+
+async function applySearch(value) {
+  const revision = ++searchRevision;
+  state.query = value;
+  state.nationalSearchHash = null;
+  state.page = 1;
+  const cleaned = normalize(value);
+  // Ignore incomplete numeric input. Lookup is supported only with 10- or 11-digit full IDs.
+  if (/^\d{10,11}$/.test(cleaned)) {
+    try {
+      const digest = await hashNationalId(cleaned);
+      if (revision !== searchRevision) return;
+      state.nationalSearchHash = digest;
+    } catch (error) {
+      console.error('ID lookup is unavailable in this browser:', error);
+      if (revision !== searchRevision) return;
+      showToast('تعذّر التحقق من الرقم في هذا المتصفح');
+    }
+  }
+  if (revision === searchRevision) render();
 }
 
 function getSortedFiltered() {
@@ -90,13 +123,9 @@ function renderPodium() {
 
 function renderRow(student) {
   const avatarStyle = ['accent-a','accent-b','accent-c'][student.rank % 3];
-  const id = student.nationalId
-    ? `<bdi dir="ltr" class="national-id">${escapeHTML(student.nationalId)}</bdi>`
-    : `<span class="missing-id">غير مذكور بالمصدر</span>`;
   return `<tr>
     <td><span class="rank-pill ${student.rank <= 3 ? 'top-rank' : ''}" aria-label="الترتيب ${student.rank}">${student.rank}</span></td>
     <td><div class="name-cell"><div class="student-avatar ${avatarStyle}" aria-hidden="true">${escapeHTML(getInitials(student.name))}</div><div><div class="student-name">${escapeHTML(student.name)}</div><div class="student-sub">التسلسل الأصلي: ${student.originalIndex}</div></div></div></td>
-    <td>${id}</td>
     <td><div class="average-display"><strong>${twoDecimals(student.average)}</strong><span class="average-track" aria-hidden="true"><i style="width:${student.average}%"></i></span></div></td>
     <td><span class="grade-badge ${gradeClass(student.grade)}">${escapeHTML(student.grade)}</span></td>
     <td><button class="details-button" type="button" data-rank="${student.rank}" aria-label="عرض تفاصيل ${escapeHTML(student.name)}">عرض التفاصيل ↗</button></td>
@@ -142,12 +171,9 @@ function openStudent(rank) {
   $('#dialogRank').textContent = `#${student.rank}`;
   $('#dialogAverage').textContent = `${twoDecimals(student.average)}%`;
   $('#dialogGrade').textContent = student.grade;
-  $('#dialogId').textContent = student.nationalId || 'غير مذكور';
   $('#dialogOriginal').textContent = student.originalIndex;
   $('#dialogPage').textContent = `${student.sourcePage} من 14`;
-  $('#copyIdBtn').disabled = !student.nationalId;
-  $('#copyIdBtn').onclick = () => copyText(student.nationalId);
-  $('#copyDetailsBtn').onclick = () => copyText(`الاسم: ${student.name}\nالرقم الوطني: ${student.nationalId || 'غير مذكور'}\nالترتيب: ${student.rank}\nالمعدل: ${twoDecimals(student.average)}\nالتقدير: ${student.grade}\nالتسلسل في المصدر: ${student.originalIndex}`);
+  $('#copyDetailsBtn').onclick = () => copyText(`الاسم: ${student.name}\nالترتيب: ${student.rank}\nالمعدل: ${twoDecimals(student.average)}\nالتقدير: ${student.grade}\nالتسلسل في المصدر: ${student.originalIndex}`);
   const dialog = $('#studentDialog');
   if (!dialog.open) dialog.showModal();
 }
@@ -171,10 +197,9 @@ async function copyText(text) {
 
 function exportCSV() {
   if (!state.filtered.length) return;
-  if (!window.confirm('سيتضمن ملف التصدير الأسماء والأرقام الوطنية الكاملة. هل تريد تنزيل هذه البيانات الشخصية؟')) return;
-  const heading = ['الترتيب', 'الاسم الكامل', 'الرقم الوطني', 'المعدل', 'التقدير', 'التسلسل الأصلي', 'صفحة المصدر'];
+  const heading = ['الترتيب', 'الاسم الكامل', 'المعدل', 'التقدير', 'التسلسل الأصلي', 'صفحة المصدر'];
   const escapeCSV = (item) => `"${String(item ?? '').replace(/"/g, '""')}"`;
-  const rows = state.filtered.map((s) => [s.rank,s.name,s.nationalId||'',twoDecimals(s.average),s.grade,s.originalIndex,s.sourcePage]);
+  const rows = state.filtered.map((s) => [s.rank,s.name,twoDecimals(s.average),s.grade,s.originalIndex,s.sourcePage]);
   const content = '\ufeff' + [heading, ...rows].map((row) => row.map(escapeCSV).join(',')).join('\r\n');
   const blob = new Blob([content], { type:'text/csv;charset=utf-8' });
   const url = URL.createObjectURL(blob);
@@ -190,8 +215,8 @@ function exportCSV() {
 
 function attachEvents() {
   $('#searchForm').addEventListener('submit', (event) => event.preventDefault());
-  $('#searchInput').addEventListener('input', (event) => { state.query = event.target.value; state.page=1; render(); });
-  $('#clearSearch').addEventListener('click', () => { $('#searchInput').value=''; state.query=''; state.page=1; render(); $('#searchInput').focus(); });
+  $('#searchInput').addEventListener('input', (event) => { void applySearch(event.target.value); });
+  $('#clearSearch').addEventListener('click', () => { $('#searchInput').value=''; void applySearch(''); $('#searchInput').focus(); });
   $('#sortSelect').addEventListener('change', (event) => { state.sort=event.target.value; state.page=1; render(); });
   $('#pageSize').addEventListener('change', (event) => { state.pageSize=Number(event.target.value); state.page=1; render(); });
   $('#gradeFilters').addEventListener('click', (event) => {
@@ -200,8 +225,8 @@ function attachEvents() {
     state.grade=tab.dataset.grade; state.page=1; render();
   });
   $('#resetFilters').addEventListener('click', () => {
-    state.query=''; state.grade='all'; state.sort='rank'; state.page=1;
-    $('#searchInput').value=''; $('#sortSelect').value='rank'; render(); $('#searchInput').focus();
+    state.grade='all'; state.sort='rank'; state.page=1;
+    $('#searchInput').value=''; $('#sortSelect').value='rank'; void applySearch(''); $('#searchInput').focus();
   });
   $('#prevPage').addEventListener('click', () => { if (state.page>1) { state.page--; render(); $('#students').scrollIntoView({block:'start'}); } });
   $('#nextPage').addEventListener('click', () => { if (state.page*state.pageSize<state.filtered.length) { state.page++; render(); $('#students').scrollIntoView({block:'start'}); } });
@@ -225,6 +250,8 @@ async function init() {
     const students = await response.json();
     if (!Array.isArray(students) || students.length !== 301) throw new Error('Student dataset failed integrity check');
     students.forEach((student) => {
+      if (Object.hasOwn(student, 'nationalId')) throw new Error('Dataset must not contain plaintext national IDs');
+      if (student.idHash !== null && !/^[a-f0-9]{64}$/.test(student.idHash)) throw new Error('Invalid ID lookup digest');
       student._normalizedName = normalize(student.name);
       if (!Number.isFinite(student.average)) throw new Error('Invalid average value');
     });
@@ -234,7 +261,7 @@ async function init() {
     render();
   } catch (error) {
     console.error('Could not load local data:', error);
-    $('#studentsBody').innerHTML = '<tr><td colspan="6" class="loading-cell">تعذّر تحميل البيانات. شغّل الموقع عبر خادم محلي أو GitHub Pages، وتأكد من وجود data/students.json.</td></tr>';
+    $('#studentsBody').innerHTML = '<tr><td colspan="5" class="loading-cell">تعذّر تحميل البيانات. شغّل الموقع عبر خادم محلي أو GitHub Pages، وتأكد من وجود data/students.json.</td></tr>';
     $('#podium').textContent = 'تعذّر تحميل قائمة المتصدرين';
     $('#resultSummary').textContent = 'تعذّر تحميل بيانات الطلاب';
     $('#pagination').hidden = true;
